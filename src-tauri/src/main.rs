@@ -838,7 +838,13 @@ async fn list_apps(serial: String) -> Result<Vec<AppInfo>, String> {
                         app.system = system;
                     }
                     if let Some(version) = &b.version {
-                        if !version.trim().is_empty() && version != "null" {
+                        // The bridge data is a cached snapshot (refreshed with the
+                        // icons); never let it override the live version read from
+                        // `dumpsys`, otherwise updated apps keep their old number.
+                        if app.version.is_none()
+                            && !version.trim().is_empty()
+                            && version != "null"
+                        {
                             app.version = Some(version.clone());
                         }
                     }
@@ -1575,6 +1581,23 @@ fn pull_package_parts(
     Ok(parts)
 }
 
+/// Live `versionName` of an installed package (owner profile), if available.
+fn package_version(serial: &str, package: &str) -> Option<String> {
+    let out = run_adb(&[
+        s("-s"),
+        serial.to_string(),
+        s("shell"),
+        s("dumpsys"),
+        s("package"),
+        s(package),
+    ])
+    .ok()?;
+    out.lines()
+        .find_map(|line| line.trim().strip_prefix("versionName="))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 fn extract_apk_blocking(
     serial: &str,
     package: &str,
@@ -1584,6 +1607,11 @@ fn extract_apk_blocking(
     if !valid_package(package) {
         return Err("اسم حزمة غير صالح".into());
     }
+
+    // The UI may still hold an old version from a cached list; ask the device
+    // so the saved file always carries the installed version.
+    let live_version = package_version(serial, package);
+    let version = live_version.as_deref().or(version);
 
     let dir = download_dir().join("adb-appcontrol-apks");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
