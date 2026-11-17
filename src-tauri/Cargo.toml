@@ -1,6 +1,6 @@
 [package]
 name = "adb-appcontrol"
-version = "0.1.0"
+version = "0.1.1"
 description = "ADB Control Desktop - open-source ADB device manager"
 authors = ["ADB Control Desktop contributors"]
 edition = "2021"
