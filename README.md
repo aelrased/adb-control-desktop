@@ -63,7 +63,7 @@ Google (Apache‑2.0).
 - **لقطة شاشة** إلى `~/Pictures/ADB AppControl`.
 - **Logcat** (آخر 300 سطر) داخل لوحة الطرفية.
 - **طرفية ADB مدمجة** لتنفيذ أوامر شل على الجهاز.
-- **تكامل CleanYourTV**: زر «CleanYourTV» يستخدم **466 ملف تعريف مضمّنة داخل البرنامج** (بدون إنترنت) من
+- **تكامل CleanYourTV**: زر «CleanYourTV» يستخدم **488 ملف تعريف مضمّن داخل البرنامج** (بدون إنترنت) من
   [Gathin23/cleanyourtv](https://github.com/Gathin23/cleanyourtv)، يطابق ملف الجهاز
   تلقائياً (مثل Mi Box S/MIBOX4)، مع زر تحديث اختياري للقوائم، ثم يعطّل الحزم أو يستعيدها عبر `pm disable-user` /
   `pm enable` — بدون حذف أي تطبيق.
