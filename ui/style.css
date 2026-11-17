@@ -166,7 +166,10 @@ input:focus, select:focus { border-color: var(--accent); }
 }
 .ram-fill.warn { background: linear-gradient(90deg, #d29922, #e3b341); }
 .ram-fill.danger { background: linear-gradient(90deg, #da3633, #f85149); }
-.ram-btn { width: 100%; margin-top: 10px; }
+.ram-actions {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px;
+}
+.ram-actions .btn { width: 100%; }
 
 .quick-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .quick {

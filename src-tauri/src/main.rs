@@ -7,7 +7,7 @@ use serde::Serialize;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::Manager;
 
 static TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -616,20 +616,153 @@ async fn kill_process(serial: String, name: String) -> Result<String, String> {
     Ok(format!("تم إيقاف {pkg}"))
 }
 
+/// Force-stop every running third-party app of the owner profile.
+///
+/// Safety rules, so the device stays usable:
+/// - only packages installed for user 0 are considered;
+/// - system packages are never touched;
+/// - the current launcher (HOME), the active keyboard and the bridge helper are
+///   protected, because on Android TV they are often third-party apps too.
+#[tauri::command]
+async fn kill_all_apps(serial: String) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || kill_all_apps_blocking(&serial))
+        .await
+        .map_err(|e| format!("خطأ داخلي: {e}"))?
+}
+
+fn kill_all_apps_blocking(serial: &str) -> Result<usize, String> {
+    let third_raw = run_adb(&[
+        s("-s"),
+        serial.to_string(),
+        s("shell"),
+        s("pm"),
+        s("list"),
+        s("packages"),
+        s("-3"),
+        s("--user"),
+        s("0"),
+    ])?;
+    let third: std::collections::HashSet<String> = third_raw
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("package:"))
+        .map(|pkg| pkg.trim().to_string())
+        .collect();
+
+    let ps_raw = match run_adb(&[
+        s("-s"),
+        serial.to_string(),
+        s("shell"),
+        s("ps"),
+        s("-A"),
+        s("-o"),
+        s("NAME"),
+    ]) {
+        Ok(out) => out,
+        Err(_) => run_adb(&[s("-s"), serial.to_string(), s("shell"), s("ps"), s("-A")])
+            .unwrap_or_default(),
+    };
+
+    let protect_raw = run_adb(&[
+        s("-s"),
+        serial.to_string(),
+        s("shell"),
+        s(
+            "cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.HOME 2>/dev/null; settings get secure default_input_method 2>/dev/null",
+        ),
+    ])
+    .unwrap_or_default();
+
+    let mut protected: std::collections::HashSet<String> = std::collections::HashSet::new();
+    protected.insert(BRIDGE_PKG.to_string());
+    for line in protect_raw.lines() {
+        let Some(component) = line.split_whitespace().find(|part| part.contains('/')) else {
+            continue;
+        };
+        let pkg = component.split('/').next().unwrap_or("").trim();
+        if !pkg.is_empty() {
+            protected.insert(pkg.to_string());
+        }
+    }
+
+    let mut targets: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in ps_raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line == "NAME" {
+            continue;
+        }
+        // `ps -o NAME` prints the name alone; the `ps -A` fallback puts it in
+        // the last column (USER PID PPID ... NAME).
+        let mut parts = line.split_whitespace();
+        let single = parts.next().unwrap_or("");
+        let name = match parts.last() {
+            Some(last) => last,
+            None => single,
+        };
+        let base = name.split(':').next().unwrap_or("").trim();
+        if base.is_empty()
+            || !valid_package(base)
+            || protected.contains(base)
+            || !third.contains(base)
+        {
+            continue;
+        }
+        if seen.insert(base.to_string()) {
+            targets.push(base.to_string());
+        }
+    }
+    targets.sort();
+    if debug_on() {
+        eprintln!(
+            "[kill-all] third={} protected={:?} targets={:?}",
+            third.len(),
+            protected,
+            targets
+        );
+    }
+    if targets.is_empty() {
+        return Ok(0);
+    }
+
+    // One shell round trip: force-stop each target, counting successes.
+    let mut script = String::from("ok=0; for p in");
+    for pkg in &targets {
+        script.push(' ');
+        script.push_str(pkg);
+    }
+    script.push_str("; do am force-stop --user 0 \"$p\" >/dev/null 2>&1 && ok=$((ok+1)); done; echo $ok");
+    let out = run_adb(&[s("-s"), serial.to_string(), s("shell"), script])?;
+    let stopped = out
+        .lines()
+        .find_map(|line| line.trim().parse::<usize>().ok())
+        .unwrap_or(targets.len());
+    Ok(stopped)
+}
+
 #[tauri::command]
 async fn list_apps(serial: String) -> Result<Vec<AppInfo>, String> {
     let base = vec![s("-s"), serial.clone()];
 
     let mut cmd = base.clone();
-    cmd.extend([s("shell"), s("pm"), s("list"), s("packages"), s("-f")]);
+    // Only packages installed for the owner user: every action in this app
+    // targets `--user 0`, and `pm list packages -f` without `--user` also
+    // returns packages installed only for secondary profiles, which then fail
+    // to uninstall with "not installed for 0".
+    cmd.extend([
+        s("shell"), s("pm"), s("list"), s("packages"), s("-f"), s("--user"), s("0"),
+    ]);
     let packages_raw = adb(cmd).await?;
 
     let mut dcmd = base.clone();
-    dcmd.extend([s("shell"), s("pm"), s("list"), s("packages"), s("-d")]);
+    dcmd.extend([
+        s("shell"), s("pm"), s("list"), s("packages"), s("-d"), s("--user"), s("0"),
+    ]);
     let disabled_raw = adb(dcmd).await.unwrap_or_default();
 
     let mut ucmd = base.clone();
-    ucmd.extend([s("shell"), s("pm"), s("list"), s("packages"), s("-3")]);
+    ucmd.extend([
+        s("shell"), s("pm"), s("list"), s("packages"), s("-3"), s("--user"), s("0"),
+    ]);
     let user_raw = adb(ucmd).await.unwrap_or_default();
 
     let disabled: std::collections::HashSet<String> = disabled_raw
@@ -1253,6 +1386,11 @@ async fn app_action(serial: String, package: String, action: String) -> Result<S
     }
     let out = adb(args).await?;
     let t = out.trim();
+    if t.contains("not installed for 0") {
+        return Err(
+            "هذا التطبيق غير مثبت للمستخدم 0 (قد يكون مثبتاً لمستخدم آخر على الجهاز)".into(),
+        );
+    }
     if t.contains("Failure") || t.contains("Exception") || t.contains("Error") {
         return Err(t.to_string());
     }
@@ -2024,6 +2162,52 @@ async fn reboot(serial: String, mode: String) -> Result<String, String> {
     adb(args).await
 }
 
+/// Version code of the bridge APK embedded in this build (see bridge/build.sh).
+const BRIDGE_VERSION_CODE: &str = "2";
+
+fn bridge_installed_version(serial: &str) -> Option<String> {
+    // A previous `pm uninstall --user 0` leaves the APK known to the package
+    // manager (other profiles, retained data), so `dumpsys` alone is not enough:
+    // require the package to be listed for user 0 before trusting its version.
+    let out = run_adb(&[
+        s("-s"),
+        serial.to_string(),
+        s("shell"),
+        format!("pm list packages --user 0 {BRIDGE_PKG}; dumpsys package {BRIDGE_PKG}"),
+    ])
+    .ok()?;
+    let installed_for_owner = out
+        .lines()
+        .any(|line| line.trim() == format!("package:{BRIDGE_PKG}"));
+    if !installed_for_owner {
+        return None;
+    }
+    out.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("versionCode=")?;
+        Some(value.split_whitespace().next().unwrap_or("").to_string())
+    })
+}
+
+fn install_bridge(serial: &str, apk_path: &str) -> Result<(), String> {
+    let args = [
+        s("-s"),
+        serial.to_string(),
+        s("install"),
+        s("-r"),
+        apk_path.to_string(),
+    ];
+    let out = run_adb(&args)?;
+    if out.contains("Failure") {
+        // Older bridge builds may be signed with a different key.
+        let _ = run_adb(&[s("-s"), serial.to_string(), s("uninstall"), s(BRIDGE_PKG)]);
+        let retry = run_adb(&args)?;
+        if retry.contains("Failure") {
+            return Err(retry);
+        }
+    }
+    Ok(())
+}
+
 fn sync_bridge_blocking(serial: &str) -> Result<String, String> {
     let cache = cache_dir();
     std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
@@ -2031,68 +2215,45 @@ fn sync_bridge_blocking(serial: &str) -> Result<String, String> {
     let apk_path = cache.join("bridge.apk");
     std::fs::write(&apk_path, BRIDGE_APK).map_err(|e| format!("تعذّر كتابة bridge.apk: {e}"))?;
 
-    let installed = run_adb(&[
-        s("-s"),
-        serial.to_string(),
-        s("shell"),
-        s("pm"),
-        s("path"),
-        s(BRIDGE_PKG),
-    ])
-    .map(|o| o.contains("package:"))
-    .unwrap_or(false);
-
-    if !installed {
-        let install_args = &[
-            s("-s"),
-            serial.to_string(),
-            s("install"),
-            s("-r"),
-            apk_path.to_string_lossy().to_string(),
-        ];
-        let out = run_adb(install_args)?;
-        if out.contains("Failure") {
-            // Older bridge builds may be signed with a different key.
-            let _ = run_adb(&[s("-s"), serial.to_string(), s("uninstall"), s(BRIDGE_PKG)]);
-            let retry = run_adb(install_args)?;
-            if retry.contains("Failure") {
-                return Err(retry);
-            }
-        }
+    // The bridge now exports one ZIP instead of hundreds of PNG files, so old
+    // installs must be upgraded once before the fast path can run.
+    let installed_version = bridge_installed_version(serial);
+    let up_to_date = matches!(
+        installed_version.as_deref(),
+        Some(version) if version == BRIDGE_VERSION_CODE
+    );
+    if !up_to_date {
+        install_bridge(serial, &apk_path.to_string_lossy())?;
     }
 
-    let _ = run_adb(&[
-        s("-s"),
-        serial.to_string(),
-        s("shell"),
-        s("pm"),
-        s("grant"),
-        s(BRIDGE_PKG),
-        s("android.permission.WRITE_EXTERNAL_STORAGE"),
-    ]);
+    // One round trip: storage permission (only used on old Android) + SDK level.
     let sdk_out = run_adb(&[
         s("-s"),
         serial.to_string(),
         s("shell"),
-        s("getprop"),
-        s("ro.build.version.sdk"),
+        format!(
+            "pm grant {BRIDGE_PKG} android.permission.WRITE_EXTERNAL_STORAGE; getprop ro.build.version.sdk"
+        ),
     ])
     .unwrap_or_default();
-    let sdk: i32 = sdk_out.trim().parse().unwrap_or(0);
+    let sdk: i32 = sdk_out
+        .lines()
+        .filter_map(|line| line.trim().parse::<i32>().ok())
+        .last()
+        .unwrap_or(0);
     let remote = if sdk < 29 {
         "/sdcard/Download/ADBControlBridge".to_string()
     } else {
         bridge_remote_dir()
     };
-    let ready = format!("{remote}/ready");
-    let _ = run_adb(&[s("-s"), serial.to_string(), s("shell"), s("rm"), s("-f"), ready.clone()]);
+    let remote_zip = format!("{remote}/icons.zip");
+    let remote_ready = format!("{remote}/ready");
+
     let _ = run_adb(&[
         s("-s"),
         serial.to_string(),
         s("shell"),
-        s("am"),
-        s("force-stop"),
-        s(BRIDGE_PKG),
+        format!("rm -f {remote_zip} {remote_ready}; am force-stop {BRIDGE_PKG}"),
     ]);
     let trigger = run_adb(&[
         s("-s"),
@@ -2117,53 +2278,86 @@ fn sync_bridge_blocking(serial: &str) -> Result<String, String> {
         ]);
     }
 
-    let mut finished = false;
-    for _ in 0..360 {
-        std::thread::sleep(Duration::from_millis(500));
-        if let Ok(out) = run_adb(&[
-            s("-s"),
-            serial.to_string(),
-            s("shell"),
-            s("cat"),
-            ready.clone(),
-        ]) {
-            if out.contains("\"apps\"") {
-                finished = true;
-                break;
-            }
-        }
-    }
-    if !finished {
+    // Wait on the device itself: one adb process for the whole export instead of
+    // one `adb shell cat ready` every 500 ms.
+    let wait_script = format!(
+        "i=0; while [ ! -f {remote_zip} ] && [ $i -lt 120 ]; do sleep 1; i=$((i+1)); done; \
+         if [ -f {remote_zip} ]; then echo READY; else echo TIMEOUT; fi"
+    );
+    let waited = run_adb(&[
+        s("-s"),
+        serial.to_string(),
+        s("shell"),
+        wait_script,
+    ])?;
+    if !waited.contains("READY") {
         return Err("انتهت المهلة قبل أن ينهي التطبيق المساعد قراءة الأيقونات".into());
     }
 
+    // Single-file transfer: icons + metadata travel together in one pull.
+    let zip_target = cache.join(format!("bridge-icons-{}.zip", safe_serial(serial)));
+    let _ = std::fs::remove_file(&zip_target);
+    run_adb(&[
+        s("-s"),
+        serial.to_string(),
+        s("pull"),
+        remote_zip,
+        zip_target.to_string_lossy().to_string(),
+    ])?;
+
     let icons_target = icons_dir(serial);
+    let staging = cache
+        .join("icons")
+        .join(format!("{}.new", safe_serial(serial)));
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
+
+    let json_target = bridge_json_path(serial);
+    let archive_file = std::fs::File::open(&zip_target).map_err(|e| e.to_string())?;
+    let mut archive =
+        zip::ZipArchive::new(archive_file).map_err(|e| format!("ملف الأيقونات غير صالح: {e}"))?;
+    let mut count = 0usize;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|e| e.to_string())?;
+        if entry.is_dir() {
+            continue;
+        }
+        let name = entry.name().to_string();
+        if name == "_apps.json" {
+            use std::io::Read as _;
+            let mut text = String::new();
+            entry.read_to_string(&mut text).map_err(|e| e.to_string())?;
+            std::fs::write(&json_target, text).map_err(|e| e.to_string())?;
+            continue;
+        }
+        let Some(pkg) = name.strip_suffix(".png") else {
+            continue;
+        };
+        if !valid_package(pkg) {
+            continue;
+        }
+        let mut out = std::fs::File::create(staging.join(format!("{pkg}.png")))
+            .map_err(|e| e.to_string())?;
+        std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
+        count += 1;
+    }
+    let _ = std::fs::remove_file(&zip_target);
+
+    if count == 0 {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err("لم يستورد التطبيق المساعد أي أيقونة".into());
+    }
+
     let _ = std::fs::remove_dir_all(&icons_target);
     if let Some(parent) = icons_target.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    run_adb(&[
-        s("-s"),
-        serial.to_string(),
-        s("pull"),
-        format!("{remote}/icons"),
-        icons_target.to_string_lossy().to_string(),
-    ])?;
+    std::fs::rename(&staging, &icons_target).map_err(|e| e.to_string())?;
 
-    let json_target = bridge_json_path(serial);
-    run_adb(&[
-        s("-s"),
-        serial.to_string(),
-        s("pull"),
-        format!("{remote}/apps.json"),
-        json_target.to_string_lossy().to_string(),
-    ])?;
-
-    let count = std::fs::read_dir(&icons_target)
-        .map(|it| it.filter_map(|e| e.ok()).count())
-        .unwrap_or(0);
-
-    Ok(format!("تم استيراد {count} أيقونة وبيانات {} تطبيقاً", bridge_count(serial)))
+    Ok(format!(
+        "تم استيراد {count} أيقونة وبيانات {} تطبيقاً",
+        bridge_count(serial)
+    ))
 }
 
 fn bridge_count(serial: &str) -> usize {
@@ -2191,17 +2385,44 @@ async fn bridge_status(serial: String) -> Result<serde_json::Value, String> {
         s("-s"),
         serial.clone(),
         s("shell"),
-        s("pm"),
-        s("path"),
-        s(BRIDGE_PKG),
+        format!("pm list packages --user 0 {BRIDGE_PKG}"),
     ])
-    .map(|o| o.contains("package:"))
+    .map(|o| o.lines().any(|l| l.trim() == format!("package:{BRIDGE_PKG}")))
     .unwrap_or(false);
     Ok(serde_json::json!({
         "installed": installed,
         "icons": icons,
         "apps": bridge_count(&serial),
     }))
+}
+
+#[tauri::command]
+async fn get_icons(
+    serial: String,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut out = std::collections::HashMap::new();
+        let entries = match std::fs::read_dir(icons_dir(&serial)) {
+            Ok(entries) => entries,
+            Err(_) => return Ok(out),
+        };
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(pkg) = name.strip_suffix(".png") else {
+                continue;
+            };
+            if !valid_package(pkg) {
+                continue;
+            }
+            if let Ok(bytes) = std::fs::read(entry.path()) {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+                out.insert(pkg.to_string(), format!("data:image/png;base64,{encoded}"));
+            }
+        }
+        Ok(out)
+    })
+    .await
+    .map_err(|e| format!("خطأ داخلي: {e}"))?
 }
 
 #[tauri::command]
@@ -2770,6 +2991,22 @@ fn main() {
         return;
     }
 
+    if args.iter().any(|a| a == "--kill-all") {
+        let serial = args.get(2).cloned().unwrap_or_default();
+        if serial.is_empty() {
+            eprintln!("usage: --kill-all <serial>");
+            std::process::exit(2);
+        }
+        match kill_all_apps_blocking(&serial) {
+            Ok(n) => println!("stopped {n} apps"),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     if args.iter().any(|a| a == "--selftest") {
         let serial = args.get(2).cloned().unwrap_or_default();
         if serial.is_empty() {
@@ -2814,6 +3051,7 @@ fn main() {
             device_memory,
             list_processes,
             kill_process,
+            kill_all_apps,
             list_apps,
             list_removed_apps,
             list_permissions,
@@ -2831,6 +3069,7 @@ fn main() {
             run_command,
             sync_bridge,
             bridge_status,
+            get_icons,
             get_icon
         ])
         .run(tauri::generate_context!())

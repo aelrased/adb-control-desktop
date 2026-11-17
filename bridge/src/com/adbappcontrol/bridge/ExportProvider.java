@@ -11,8 +11,11 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Headless trigger: `adb shell content call --uri content://com.adbappcontrol.bridge.export --method export`
- * Runs the export in a background thread and returns immediately; the host polls the ready file.
+ * Headless trigger:
+ * `adb shell content call --uri content://com.adbappcontrol.bridge.export --method export`
+ * Optional: `--es size 96` selects the longest icon edge (default 128).
+ * Runs the export in a background thread and returns immediately; the host waits
+ * for icons.zip on the device.
  */
 public class ExportProvider extends ContentProvider {
 
@@ -29,10 +32,11 @@ public class ExportProvider extends ContentProvider {
             return null;
         }
         final Context context = getContext();
+        final int size = extras != null ? extras.getInt("size", 128) : 128;
         if (context != null) {
             EXECUTOR.execute(() -> {
                 try {
-                    Exporter.export(context);
+                    Exporter.export(context, size);
                 } catch (Throwable ignored) {
                 }
             });

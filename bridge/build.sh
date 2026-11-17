@@ -27,6 +27,7 @@ echo "==> d8"
 echo "==> aapt2 link"
 "$BT/aapt2" link -o "$OUT/base.apk" -I "$PLATFORM" \
   --manifest AndroidManifest.xml \
+  --version-code 2 --version-name 1.1.0 \
   --min-sdk-version 24 --target-sdk-version 28
 
 echo "==> add dex"

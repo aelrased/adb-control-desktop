@@ -208,6 +208,8 @@ async function refreshDevices() {
 
 async function onDeviceChanged() {
   state.selected.clear();
+  iconCache.clear();
+  iconsSerial = null;
   updateSelectionUi();
   if (!state.serial) {
     stopMemory();
@@ -301,6 +303,8 @@ function stopMemory() {
   updateMemoryUi();
   const btn = $("btnProcesses");
   if (btn) btn.disabled = true;
+  const killAll = $("btnKillAll");
+  if (killAll) killAll.disabled = true;
 }
 
 function startMemory() {
@@ -308,6 +312,8 @@ function startMemory() {
   if (!state.serial) return;
   const btn = $("btnProcesses");
   if (btn) btn.disabled = false;
+  const killAll = $("btnKillAll");
+  if (killAll) killAll.disabled = false;
   refreshMemory();
   memoryTimer = setInterval(refreshMemory, 15000);
 }
@@ -392,6 +398,32 @@ async function stopProcess(name) {
   await refreshMemory();
 }
 
+/** Force-stop every running third-party app (launcher/keyboard/system kept). */
+async function killAllApps() {
+  if (!state.serial) return toast(t("cleanNoDevice"), true);
+  const ok = await dialog.confirm(t("killAllConfirm"), {
+    title: t("confirmTitle"),
+    kind: "warning",
+  });
+  if (!ok) return;
+  setBusy(true, t("killAllBusy"));
+  const n = await safe(
+    () => invoke("kill_all_apps", { serial: state.serial }),
+    t("errKillAll")
+  );
+  setBusy(false);
+  if (n === null) return;
+  if (n > 0) {
+    const msg = t("killAllDone", { n });
+    log(msg, "ok");
+    toast(msg);
+  } else {
+    toast(t("killAllNone"));
+  }
+  await refreshMemory();
+  if (!$("procModal").classList.contains("hidden")) await loadProcesses();
+}
+
 /* ---------------- Apps ---------------- */
 
 async function refreshApps() {
@@ -461,23 +493,10 @@ function iconColor(pkg) {
   return ICON_COLORS[Math.abs(h) % ICON_COLORS.length];
 }
 
-/* ---------- Real icons (lazy, concurrency-limited) ---------- */
-const iconCache = new Map();   // package -> data URL | null
-const iconPending = new Set();
-const iconQueue = [];
-let iconActive = 0;
-const ICON_CONCURRENCY = 4;
-
-function pumpIcons() {
-  while (iconActive < ICON_CONCURRENCY && iconQueue.length) {
-    const task = iconQueue.shift();
-    iconActive++;
-    task().finally(() => {
-      iconActive--;
-      pumpIcons();
-    });
-  }
-}
+/* ---------- Real icons (one bulk load, cached) ---------- */
+const iconCache = new Map();   // package -> data URL
+let iconsSerial = null;        // device whose icons are cached
+let iconsLoading = false;
 
 function applyCachedIcon(el) {
   const pkg = el.dataset.pkg;
@@ -491,41 +510,29 @@ function applyCachedIcon(el) {
   return true;
 }
 
-const iconObserver = new IntersectionObserver(
-  (entries) => {
-    for (const entry of entries) {
-      if (entry.isIntersecting) {
-        loadIcon(entry.target);
-        iconObserver.unobserve(entry.target);
-      }
-    }
-  },
-  { root: document.querySelector(".table-wrap"), rootMargin: "300px" }
-);
-
-function observeIcons() {
-  document.querySelectorAll(".app-icon[data-pkg]").forEach((el) => {
-    if (!applyCachedIcon(el)) iconObserver.observe(el);
-  });
+function applyIcons() {
+  document.querySelectorAll(".app-icon[data-pkg]").forEach((el) => applyCachedIcon(el));
 }
 
-function loadIcon(el) {
-  const pkg = el.dataset.pkg;
-  if (!pkg || !state.serial) return;
-  if (iconCache.has(pkg)) {
-    applyCachedIcon(el);
+/** Pull every icon once (single IPC call) instead of one request per row. */
+async function ensureIcons() {
+  const serial = state.serial;
+  if (!serial) return;
+  if (iconsSerial === serial) {
+    applyIcons();
     return;
   }
-  if (iconPending.has(pkg)) return;
-  iconPending.add(pkg);
-  const serial = state.serial;
-  iconQueue.push(async () => {
-    const url = await safe(() => invoke("get_icon", { serial, package: pkg }), t("errIcons"));
-    iconCache.set(pkg, url || null);
-    iconPending.delete(pkg);
-    document.querySelectorAll(`.app-icon[data-pkg="${CSS.escape(pkg)}"]`).forEach(applyCachedIcon);
-  });
-  pumpIcons();
+  if (iconsLoading) return;
+  iconsLoading = true;
+  const map = await safe(() => invoke("get_icons", { serial }), t("errIcons"));
+  iconsLoading = false;
+  if (state.serial !== serial) return;
+  iconCache.clear();
+  if (map) {
+    for (const [pkg, url] of Object.entries(map)) iconCache.set(pkg, url);
+  }
+  iconsSerial = serial;
+  applyIcons();
 }
 
 async function syncIcons() {
@@ -542,7 +549,7 @@ async function syncIcons() {
     log(res, "ok");
     toast(res);
     iconCache.clear();
-    iconPending.clear();
+    iconsSerial = null;
     await refreshApps();
   }
 }
@@ -599,7 +606,8 @@ function renderTable() {
   }
   tbody.replaceChildren(frag);
   updateSelectionUi();
-  observeIcons();
+  applyIcons();
+  ensureIcons();
 }
 
 function toggleRow(pkg, on) {
@@ -1578,6 +1586,7 @@ function wire() {
     if (e.key === "Enter") savePreset();
   });
   $("btnProcesses").addEventListener("click", () => openProcesses());
+  $("btnKillAll").addEventListener("click", () => killAllApps());
   $("procClose").addEventListener("click", () => $("procModal").classList.add("hidden"));
   $("procRefresh").addEventListener("click", async () => {
     await refreshMemory();
